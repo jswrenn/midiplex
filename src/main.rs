@@ -79,8 +79,9 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
           for (&(note, channel), outputs) in allocations.iter_mut() {
             if Some(&outputs.len()) > target_allocation.get(&(note, channel)) {
               if let Some(mut output) = outputs.pop() {
-                let _ = NoteOff(channel, note, velocity).write(&mut message_buffer);
+                let _ = NoteOff(channel, note, 0).write(&mut message_buffer);
                 let _ = output.send(&message_buffer[..]);
+                message_buffer.clear();
                 unallocated.push(output);
               } else {
                 continue;
@@ -93,17 +94,15 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
           for (&(note, channel), outputs) in allocations.iter_mut() {
             while Some(&outputs.len()) < target_allocation.get(&(note, channel)) {
               if let Some(mut output) = unallocated.pop() {
-                let _ = NoteOff(channel, note, velocity).write(&mut message_buffer);
+                let _ = NoteOn(channel, note, velocity).write(&mut message_buffer);
                 let _ = output.send(&message_buffer[..]);
+                message_buffer.clear();
                 outputs.push(output);
               } else {
                 return;
               }
             }
           }
-
-          // clear the message buffer
-          message_buffer.clear();
         },
         _ => {return;}
       }
