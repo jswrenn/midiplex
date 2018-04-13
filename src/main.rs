@@ -1,10 +1,13 @@
 extern crate midir;
+extern crate wmidi;
 #[macro_use] extern crate structopt;
 
 use std::cmp::min;
 use std::error::Error;
 use structopt::StructOpt;
 use std::collections::BTreeMap;
+use wmidi::MidiMessage::{self, *};
+use wmidi::{Note, Channel, Velocity};
 use midir::os::unix::{VirtualInput, VirtualOutput};
 use midir::{MidiInput, MidiOutput, MidiOutputConnection, Ignore};
 
@@ -22,8 +25,8 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
   // ignore all fancy events
   input.ignore(Ignore::All);
 
-  let notes: BTreeMap<u8, u8> = BTreeMap::new();
-  let allocations: BTreeMap<u8, Vec<MidiOutputConnection>> = BTreeMap::new();
+  let notes: BTreeMap<(Note, Channel), Velocity> = BTreeMap::new();
+  let allocations: BTreeMap<(Note, Channel), Vec<MidiOutputConnection>> = BTreeMap::new();
   let mut unallocated: Vec<MidiOutputConnection> = Vec::with_capacity(num_channels);
 
   for i in 0..num_channels {
@@ -32,25 +35,23 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
         .create_virtual("out").unwrap());
   }
 
+  let mut message_buffer = Vec::with_capacity(3);
+
   // create a virtual midi port
   let _port = input.create_virtual("in",
-    move |_, message, (notes, allocations, unallocated)| {
-
-      // we will only handle two messages, NOTE_ON and NOTE_OFF:
-      const NOTE_ON : u8 = 0x90;
-      const NOTE_OFF: u8 = 0x80;
-
+    move |_, raw_message, (notes, allocations, unallocated)| {
+      let message = MidiMessage::from_bytes(raw_message);
       match message {
-        [c@NOTE_ON,  note, velocity] | [c@NOTE_OFF, note, velocity] => {
-          if c == &NOTE_ON   {
-            notes.insert(*note, *velocity);
-            allocations.entry(*note).or_insert(Vec::new());
+        Ok(NoteOn(channel, note, velocity)) | Ok(NoteOff(channel, note, velocity)) => {
+          if let Ok(NoteOn(_, _, _)) = message {
+            notes.insert((note, channel), velocity);
+            allocations.entry((note, channel)).or_insert(Vec::new());
           }
-          if c == &NOTE_OFF  {
-            notes.remove(note);
-            if let Some(outputs) = allocations.remove(note) {
+          if let Ok(NoteOff(_, _, _)) = message {
+            notes.remove(&(note, channel));
+            if let Some(outputs) = allocations.remove(&(note, channel)) {
               for mut output in outputs {
-                output.send(&[NOTE_OFF, *note, *velocity]).unwrap();
+                let _ = output.send(raw_message);
                 unallocated.push(output);
               }
             }
@@ -63,7 +64,7 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
 
           let remaining = &mut num_channels.clone();
 
-          let target_allocation : BTreeMap<u8, usize> =
+          let target_allocation : BTreeMap<(Note, Channel), usize> =
             notes.iter().map(move |(&note, &velocity)|
               { let relative_velocity = (velocity as f32) / total_velocity;
                 let allocation =
@@ -75,10 +76,11 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
 
           // next, we'll deallocate from any over-allocated notes
 
-          for (note, outputs) in allocations.iter_mut() {
-            if Some(&outputs.len()) > target_allocation.get(note) {
+          for (&(note, channel), outputs) in allocations.iter_mut() {
+            if Some(&outputs.len()) > target_allocation.get(&(note, channel)) {
               if let Some(mut output) = outputs.pop() {
-                output.send(&[NOTE_OFF, *note, *velocity]).unwrap();
+                let _ = NoteOff(channel, note, velocity).write(&mut message_buffer);
+                let _ = output.send(&message_buffer[..]);
                 unallocated.push(output);
               } else {
                 continue;
@@ -88,10 +90,11 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
 
           // finally, we'll reallocate the freed-up notes
 
-          for (note, outputs) in allocations.iter_mut() {
-            while Some(&outputs.len()) < target_allocation.get(note) {
+          for (&(note, channel), outputs) in allocations.iter_mut() {
+            while Some(&outputs.len()) < target_allocation.get(&(note, channel)) {
               if let Some(mut output) = unallocated.pop() {
-                output.send(&[NOTE_ON, *note, *velocity]).unwrap();
+                let _ = NoteOff(channel, note, velocity).write(&mut message_buffer);
+                let _ = output.send(&message_buffer[..]);
                 outputs.push(output);
               } else {
                 return;
@@ -99,6 +102,8 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
             }
           }
 
+          // clear the message buffer
+          message_buffer.clear();
         },
         _ => {return;}
       }
