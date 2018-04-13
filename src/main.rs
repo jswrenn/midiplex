@@ -76,15 +76,15 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
 
           // next, we'll deallocate from any over-allocated notes
 
-          for (&(note, channel), outputs) in allocations.iter_mut() {
-            if Some(&outputs.len()) > target_allocation.get(&(note, channel)) {
+          'allocations: for (&(note, channel), outputs) in allocations.iter_mut() {
+            while Some(&outputs.len()) > target_allocation.get(&(note, channel)) {
               if let Some(mut output) = outputs.pop() {
                 let _ = NoteOff(channel, note, 0).write(&mut message_buffer);
                 let _ = output.send(&message_buffer[..]);
                 message_buffer.clear();
                 unallocated.push(output);
               } else {
-                continue;
+                continue 'allocations;
               }
             }
           }
