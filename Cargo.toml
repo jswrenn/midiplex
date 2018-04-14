@@ -1,6 +1,6 @@
 [package]
 name = "midiplex"
-version = "0.2.2"
+version = "0.3.0"
 authors = ["Jack Wrenn <me@jswrenn.com>"]
 description = "Volume-aware splitting of a polyphonic MIDI stream into multiple, monophonic streams."
 license = "MIT"
