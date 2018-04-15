@@ -2,7 +2,7 @@ extern crate midir;
 extern crate wmidi;
 #[macro_use] extern crate structopt;
 
-use std::cmp::min;
+use std::cmp::{min, max};
 use std::io::Read;
 use std::error::Error;
 use structopt::StructOpt;
@@ -79,7 +79,7 @@ fn run(num_channels:  usize) -> Result<(), Box<Error>> {
 
             let relative_velocity = (*velocity as f32) / total_velocity;
 
-            *target = min((relative_velocity * (num_channels as f32)).ceil() as usize,
+            *target = min(max(1, (relative_velocity * (num_channels as f32)).floor() as usize),
                           *remaining);
 
             *remaining -= *target;
