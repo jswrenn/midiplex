@@ -2,6 +2,8 @@
 extern crate alsa;
 
 use alsa::seq;
+use alsa::poll::poll;
+use alsa::PollDescriptors;
 use std::ffi::CString;
 use std::error::Error;
 use structopt::StructOpt;
@@ -55,7 +57,7 @@ fn output(seq: &alsa::Seq, ports: usize) -> Result<Vec<Port>, Box<Error>> {
 
 fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   let sequencer_name = CString::new(env!("CARGO_PKG_NAME"))?;
-  let sequencer = alsa::Seq::open(None, None, false)?;
+  let sequencer = alsa::Seq::open(None, None, true)?;
   sequencer.set_client_name(&sequencer_name)?;
 
   let _input_port = input(&sequencer)?;
@@ -73,8 +75,14 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   // output channels that aren't being used
   let mut unallocated: VecDeque<Port> = output_ports.clone().into();
 
+  let mut fds = (&sequencer, Some(alsa::Direction::input())).get()?;
+
   'event_loop: loop {
-    if input_stream.event_input_pending(true)? == 0 { continue; }
+    if input_stream.event_input_pending(true)? == 0 {
+      poll(fds.as_mut_slice(), -1)?;
+      continue;
+    }
+
     let event = input_stream.event_input()?;
 
     let (parity, note, channel, velocity) =
