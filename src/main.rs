@@ -101,7 +101,6 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
             event.set_source(*port);
             event.set_subs();
             event.set_direct();
-            event.set_dest(alsa::seq::Addr::broadcast());
             sequencer.event_output(&mut event)?;
             sequencer.drain_output()?;
           }
