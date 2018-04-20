@@ -9,6 +9,7 @@ use std::error::Error;
 use structopt::StructOpt;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::net::{UdpSocket, ToSocketAddrs, SocketAddr};
 
 
 type Port = i32;
@@ -19,9 +20,9 @@ type Velocity = u8;
 
 #[derive(StructOpt)]
 struct Options {
-  /// Number of MIDI channels to direct the output into
-  #[structopt(name = "N")]
-  ports: usize,
+  /// addresses of clients to connect to
+  #[structopt(name = "HOSTS")]
+  hosts: Vec<String>,
 }
 
 
@@ -38,20 +39,8 @@ fn input(seq: &alsa::Seq) -> Result<Port, Box<Error>> {
 }
 
 
-fn output(seq: &alsa::Seq, ports: usize) -> Result<Vec<Port>, Box<Error>> {
-
-  let mut outputs = Vec::with_capacity(ports);
-
-  for i in 0..ports {
-    let port_name = CString::new(format!("output_{}",i))?;
-
-    outputs.push(
-      seq.create_simple_port(&port_name,
-        seq::READ | seq::SUBS_READ,
-        seq::MIDI_GENERIC | seq::APPLICATION)?);
-  }
-
-  Ok(outputs)
+fn output<A: ToSocketAddrs>(host: A) -> Result<Vec<SocketAddr>, Box<Error>> {
+  Ok(host.to_socket_addrs()?.collect())
 }
 
 
@@ -61,21 +50,31 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   sequencer.set_client_name(&sequencer_name)?;
 
   let _input_port = input(&sequencer)?;
-  let output_ports = output(&sequencer, options.ports)?;
+  let socket = UdpSocket::bind("0.0.0.0:0")?;
+
+  let mut sinks = Vec::with_capacity(options.hosts.len());
+
+  for host in options.hosts.iter() {
+    sinks.push(output(host)?);
+  }
 
   let mut input_stream = sequencer.input();
 
   // notes currently being played and their respective velocities, target allocations, and output channels
-  let mut notes: BTreeMap<(Note, Channel), (Velocity, usize, VecDeque<Port>)>
+  let mut notes: BTreeMap<(Note, Channel), (Velocity, usize, VecDeque<Vec<SocketAddr>>)>
     = BTreeMap::new();
 
   // output channel buffers that aren't being used
-  let mut unused : Vec<VecDeque<Port>> = Vec::with_capacity(options.ports);
+  let mut unused : Vec<VecDeque<Vec<SocketAddr>>> = Vec::with_capacity(options.hosts.len());
 
   // output channels that aren't being used
-  let mut unallocated: VecDeque<Port> = output_ports.clone().into();
+  let mut unallocated: VecDeque<Vec<SocketAddr>> = sinks.clone().into();
 
   let mut fds = (&sequencer, Some(alsa::Direction::input())).get()?;
+
+  let mut buffer : [u8; 12] = [0; 12];
+  let coder = seq::MidiEvent::new(0)?;
+  coder.enable_running_status(false);
 
   'event_loop: loop {
     if input_stream.event_input_pending(true)? == 0 {
@@ -95,22 +94,12 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
           let data: seq::EvNote = event.get_data().unwrap();
           (event_type, data.note, data.channel, data.velocity)
         },
-        _ => {
-          for port in output_ports.iter() {
-            let mut event = event.clone();
-            event.set_source(*port);
-            event.set_subs();
-            event.set_direct();
-            sequencer.event_output(&mut event)?;
-            sequencer.drain_output()?;
-          }
-          continue;
-        }
+        _ => { continue; }
       };
 
     if parity == seq::EventType::Noteon {
       notes.entry((note, channel)).or_insert((velocity, 0,
-        unused.pop().unwrap_or_else(|| VecDeque::with_capacity(options.ports))));
+        unused.pop().unwrap_or_else(|| VecDeque::with_capacity(options.hosts.len()))));
     }
 
     if parity == seq::EventType::Noteoff {
@@ -119,11 +108,10 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
           let note_off =
             seq::EvNote { note: note, channel: channel, velocity: 0, ..Default::default() };
           let mut event = seq::Event::new(seq::EventType::Noteoff, &note_off);
-          event.set_source(port);
-          event.set_subs();
-          event.set_direct();
-          sequencer.event_output(&mut event)?;
-          sequencer.drain_output()?;
+          if let Ok(bytes) = coder.decode(&mut buffer[..], &mut event) {
+            socket.send_to(&buffer[0..bytes],
+              port.as_slice())?;
+          }
           unallocated.push_back(port);
         }
         unused.push(ports);
@@ -133,7 +121,7 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
     let total_velocity : f32 =
       notes.values().map(|&(v,_,_)| v as f32).sum();
 
-    let remaining = &mut options.ports.clone();
+    let remaining = &mut options.hosts.len();
 
     for (&(note, channel), (velocity, target, ports)) in notes.iter_mut() {
       use std::cmp::{min,max};
@@ -142,7 +130,7 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
 
       let relative_velocity = (*velocity as f32) / total_velocity;
 
-      *target = min(max(1, (relative_velocity * (options.ports as f32)).floor() as usize),
+      *target = min(max(1, (relative_velocity * (options.hosts.len() as f32)).floor() as usize),
                     *remaining);
 
       *remaining -= *target;
@@ -156,11 +144,10 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
         if let Some(mut port) = ports.pop_front() {
           // turn off this note for this output
           let mut event = seq::Event::new(seq::EventType::Noteoff, &data);
-          event.set_source(port);
-          event.set_subs();
-          event.set_direct();
-          sequencer.event_output(&mut event)?;
-          sequencer.drain_output()?;
+          if let Ok(bytes) = coder.decode(&mut buffer[..], &mut event) {
+            socket.send_to(&buffer[0..bytes],
+              port.as_slice())?;
+          }
           // add the output to the set of unallocated outputs
           unallocated.push_back(port);
         } else {
@@ -177,11 +164,10 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
         // take an output from the set of unallocated outputs
         if let Some(mut port) = unallocated.pop_front() {
           let mut event = seq::Event::new(seq::EventType::Noteon, &data);
-          event.set_source(port);
-          event.set_subs();
-          event.set_direct();
-          sequencer.event_output(&mut event)?;
-          sequencer.drain_output()?;
+          if let Ok(bytes) = coder.decode(&mut buffer[..], &mut event) {
+            socket.send_to(&buffer[0..bytes],
+              port.as_slice())?;
+          }
           // add this output to the set of outputs allocated to this note
           ports.push_back(port);
         } else {
