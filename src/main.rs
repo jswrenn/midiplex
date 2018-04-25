@@ -1,13 +1,16 @@
 #[macro_use] extern crate structopt;
+extern crate nix;
 extern crate alsa;
+extern crate indexmap;
 
 use alsa::seq;
 use alsa::poll::poll;
 use alsa::PollDescriptors;
+use std::fmt::Debug;
 use std::ffi::CString;
 use std::error::Error;
 use structopt::StructOpt;
-use std::collections::BTreeMap;
+use indexmap::map::IndexMap;
 use std::collections::VecDeque;
 use std::net::{UdpSocket, ToSocketAddrs, SocketAddr};
 
@@ -16,11 +19,13 @@ type Port = i32;
 type Note = u8;
 type Channel = u8;
 type Velocity = u8;
-type SocketAddrs = Vec<SocketAddr>;
 
 
 #[derive(StructOpt)]
 struct Options {
+  /// set the input pool size
+  #[structopt(short = "i", long = "input-pool-size")]
+  input_pool_size: Option<u32>,
   /// addresses of clients to connect to
   #[structopt(name = "HOSTS")]
   hosts: Vec<String>,
@@ -42,8 +47,9 @@ fn input(seq: &alsa::Seq) -> Result<Port, Box<Error>> {
 
 
 /// resolve a hostname to a socket address
-fn output<A: ToSocketAddrs>(host: A) -> Result<SocketAddrs, Box<Error>> {
-  Ok(host.to_socket_addrs()?.collect())
+fn output<A: ToSocketAddrs + Debug>(host: A) -> Result<SocketAddr, Box<Error>> {
+  Ok(host.to_socket_addrs()?.next()
+    .expect(&format!("Could not resolve {:?}.", host)))
 }
 
 
@@ -76,6 +82,10 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   let sequencer_name = CString::new(env!("CARGO_PKG_NAME"))?;
   let sequencer = alsa::Seq::open(None, None, true)?;
   sequencer.set_client_name(&sequencer_name)?;
+  sequencer.set_client_pool_output(1)?;
+  if let Some(size) = options.input_pool_size {
+    sequencer.set_client_pool_input(size)?
+  }
 
   // initialize a virtual input port for this client
   let _input_port = input(&sequencer)?;
@@ -84,21 +94,21 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   let socket = UdpSocket::bind("0.0.0.0:0")?;
 
   // resolve each given output hostname, and collect them into a vector
-  let sinks: Vec<SocketAddrs> = options.hosts.iter().map(output)
-    .collect::<Result<Vec<SocketAddrs>,_>>()?;
+  let sinks: Vec<SocketAddr> = options.hosts.iter().map(output)
+    .collect::<Result<Vec<SocketAddr>,_>>()?;
 
   // take ownership of the ALSA event input stream
   let mut input_stream = sequencer.input();
 
   // notes currently being played and their respective velocities, target allocations, and output channels
-  let mut notes: BTreeMap<(Note, Channel), (Velocity, usize, VecDeque<SocketAddrs>)>
-    = BTreeMap::new();
+  let mut notes: IndexMap<(Note, Channel), (Velocity, usize, VecDeque<SocketAddr>)>
+    = IndexMap::with_capacity(88);
 
   // output channel buffers that aren't being used
-  let mut unused : Vec<VecDeque<SocketAddrs>> = Vec::with_capacity(options.hosts.len());
+  let mut unused : Vec<VecDeque<SocketAddr>> = Vec::with_capacity(options.hosts.len());
 
   // output channels that aren't being used
-  let mut unallocated: VecDeque<SocketAddrs> = sinks.clone().into();
+  let mut unallocated: VecDeque<SocketAddr> = sinks.clone().into();
 
   // gather ALSA file descriptors
   // https://docs.rs/alsa/0.2.0/alsa/poll/trait.PollDescriptors.html#impl-PollDescriptors-1
@@ -109,23 +119,29 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
   let coder = seq::MidiEvent::new(0)?;
   coder.enable_running_status(false);
 
-  let mut send_to = move |addrs: &SocketAddrs, mut event| -> Result<usize, Box<Error>>
+  // initially, no notes are being played, thus their total velocity is zero
+  let mut total_velocity = 0.0f32;
+
+  let mut send_to = move |addr: &SocketAddr, mut event| -> Result<usize, Box<Error>>
     {
       use std::time::{Duration, Instant};
       // 'decode' the event back into bytes
       let bytes = coder.decode(&mut buffer[..], &mut event)?;
       // start the clock
       let start_time = Instant::now();
-      // send to the given addrs
-      let result = socket.send_to(&buffer[0..bytes], addrs.as_slice());
+      // send to the given addr
+      let result = socket.send_to(&buffer[0..bytes], addr);
       // stop the clock
       let elapsed = start_time.elapsed();
       // if it took more than a millisecond, print an error message
-      if elapsed > Duration::from_millis(1) {
-        eprintln!("sending to {:?} took {:?}", addrs, elapsed);
+      if elapsed > Duration::from_millis(5) {
+        eprintln!("sending to {:?} took {:?}", addr, elapsed);
       }
       Ok(result?)
     };
+
+  let mut dt = std::time::Duration::from_millis(0);
+  let mut i = 0;
 
   'event_loop: loop {
     if input_stream.event_input_pending(true)? == 0 {
@@ -134,19 +150,49 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
       continue;
     }
 
-    // read the event from ALSA's input buffer
-    let event = input_stream.event_input()?;
-
-    // decompose the event into its key components, or skip it
     let (parity, note, channel, velocity) =
-      match decompose(event) {
-        Ok(components) => components,
-        // if it's not a note on or note off event, skip it.
-        Err(_event_type) => continue,
+      {
+        // read the event from ALSA's input buffer
+        let event =
+          match input_stream.event_input() {
+            Ok(event) => event,
+            Err(error) => {
+              if error.errno() == Some(nix::Errno::ENOSPC) {
+                // > Occasionally, this function may return -ENOSPC error.
+                // > This means that the input FIFO of sequencer overran, and some events are lost.
+                // We therefore need to turn off all played notes, just in case
+                eprintln!("`input_stream.event_input` failed with ENOSPC; halting all notes");
+                total_velocity = 0.0;
+                for ((note,channel), (_, _, mut ports)) in notes.drain(..) {
+                  while let Some(port) = ports.pop_front() {
+                    let note_off =
+                      seq::EvNote { note: note, channel: channel, ..Default::default() };
+                    send_to(&port, seq::Event::new(seq::EventType::Noteoff, &note_off))?;
+                    unallocated.push_back(port);
+                  }
+                  unused.push(ports);
+                }
+                continue 'event_loop;
+              } else if error.errno() == Some(nix::Errno::EAGAIN) {
+                continue 'event_loop;
+              } else {
+                return Err(Box::new(error));
+              }
+            }
+          };
+        // decompose the event into its key components, or skip it
+        match decompose(event) {
+          Ok(components) => components,
+          // if it's not a note on or note off event, skip it.
+          Err(_event_type) => continue,
+        }
       };
+
+    let start = std::time::Instant::now();
 
     // if it's a noteon event, we add it to the table of played notes
     if parity == seq::EventType::Noteon {
+      total_velocity += velocity as f32;
       notes.entry((note, channel)).or_insert((velocity, 0,
         unused.pop().unwrap_or_else(|| VecDeque::with_capacity(options.hosts.len()))));
     }
@@ -154,10 +200,11 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
     // if it's a noteoff event, we remove the event from the table,
     // and forward it to all hosts playing the note
     if parity == seq::EventType::Noteoff {
-      if let Some((_, _, mut ports)) = notes.remove(&(note, channel)) {
+      if let Some((velocity, _, mut ports)) = notes.remove(&(note, channel)) {
+        total_velocity -= velocity as f32;
         while let Some(port) = ports.pop_front() {
           let note_off =
-            seq::EvNote { note: note, channel: channel, velocity: 0, ..Default::default() };
+            seq::EvNote { note: note, channel: channel, ..Default::default() };
           send_to(&port, seq::Event::new(seq::EventType::Noteoff, &note_off))?;
           unallocated.push_back(port);
         }
@@ -176,10 +223,7 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
     // in the second loop, we add these unallocated outputs back to
     // under-allocated notes
 
-    let total_velocity : f32 =
-      notes.values().map(|&(v,_,_)| v as f32).sum();
-
-    let remaining = &mut options.hosts.len();
+    let mut remaining = options.hosts.len();
 
     for (&(note, channel), (velocity, target, ports)) in notes.iter_mut() {
       use std::cmp::{min,max};
@@ -189,9 +233,9 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
       let relative_velocity = (*velocity as f32) / total_velocity;
 
       *target = min(max(1, (relative_velocity * (options.hosts.len() as f32)).floor() as usize),
-                    *remaining);
+                    remaining);
 
-      *remaining -= *target;
+      remaining -= *target;
 
       let data =
         seq::EvNote { note, channel:channel, velocity:*velocity, ..Default::default() };
@@ -224,6 +268,13 @@ fn run(options : &Options) -> Result<alsa::Seq, Box<Error>> {
           break;
         }
       }
+    }
+    i += 1;
+    dt += start.elapsed();
+    if i % 1000 == 0 {
+      println!("{:?}", dt / i);
+      i = 0;
+      dt = std::time::Duration::from_millis(0);
     }
   }
 }

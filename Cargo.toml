@@ -9,3 +9,5 @@ repository = "https://github.com/jswrenn/midiplex"
 [dependencies]
 alsa = "0.2"
 structopt = "0.2"
+indexmap = "1.0"
+nix = "0.9"
