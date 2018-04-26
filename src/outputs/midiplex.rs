@@ -1,7 +1,8 @@
-use types::{Note, Channel, Velocity, Output};
 use std::iter::FromIterator;
 use std::collections::VecDeque;
 use indexmap::IndexMap;
+use types::*;
+use outputs::Output;
 
 struct State<Output> {
   velocity: u8,

@@ -1,52 +1,64 @@
+#![feature(attr_literals)]
 #![feature(alloc_system)]
 extern crate alloc_system;
 
 #[macro_use] extern crate structopt;
+extern crate clap;
 extern crate nix;
 extern crate alsa;
 extern crate indexmap;
 
 use alsa::seq;
 use std::ffi::CString;
+use clap::AppSettings;
 use structopt::StructOpt;
 use std::iter::FromIterator;
 use std::net::{UdpSocket, ToSocketAddrs};
 
 mod types;
-mod midiplex;
-mod udp;
+mod outputs;
+use outputs::Output;
 
-use types::*;
-use udp::*;
-use midiplex::*;
 
-type Port = i32;
+/// Output Mode
+#[derive(StructOpt)]
+#[structopt(name = "MODE")]
+enum Mode {
+  /// UDP output mode
+  #[structopt(name = "udp")]
+  UDP {
+    /// space-delimited socket addresses of hosts to send events to
+    #[structopt(name = "HOSTS")]
+    hosts: Vec<String>,
+  },
+  /// ALSA output mode
+  #[structopt(name = "alsa")]
+  ALSA {
+    /// output pool size
+    #[structopt(short = "o", long = "output-pool-size", name="O")]
+    output_pool_size: Option<u32>,
+
+    /// space-delimited names of output ports
+    #[structopt(name = "NAMES", raw(required = "true"))]
+    names: Vec<String>,
+  }
+}
 
 
 #[derive(StructOpt)]
+#[structopt(raw(setting = "AppSettings::DisableHelpSubcommand"))]
 struct Options {
-  /// set the input pool size
-  #[structopt(short = "i", long = "input-pool-size")]
+  /// set the ALSA input pool size
+  #[structopt(short = "i", long = "input-pool-size", name="I")]
   input_pool_size: Option<u32>,
-  /// addresses of clients to connect to
-  #[structopt(name = "HOSTS")]
-  hosts: Vec<String>,
+
+  /// set the output mode
+  #[structopt(subcommand,name="MODE")]
+  output: Mode
 }
 
 
-/// create an ALSA virtual MIDI input port on this sequencer
-fn input(seq: &alsa::Seq) -> Result<Port, alsa::Error> {
-  let mut port_info = seq::PortInfo::empty()?;
-  let port_name = CString::new("input").unwrap();
-  port_info.set_name(&port_name);
-  port_info.set_capability(seq::WRITE | seq::SUBS_WRITE);
-  port_info.set_type(seq::MIDI_GENERIC | seq::APPLICATION);
-
-  seq.create_port(&port_info)?;
-
-  Ok(port_info.get_port())
-}
-
+/// wait for a note on `input` and forward it to `output`
 fn forward<'s, 'i, 'o, O>(input: &'i mut alsa::seq::Input<'s>, output: &'o mut O)
   -> Result<(), alsa::Error>
   where O: Output
@@ -77,6 +89,8 @@ fn forward<'s, 'i, 'o, O>(input: &'i mut alsa::seq::Input<'s>, output: &'o mut O
   Ok(())
 }
 
+
+/// repeatedly wait for a note on `input` and forward it to `output`
 fn forward_all<'s, 'i, 'o, O>(input: &'i mut alsa::seq::Input<'s>, output: &'o mut O)
   -> Result<!, alsa::Error>
   where O: Output
@@ -99,34 +113,59 @@ fn forward_all<'s, 'i, 'o, O>(input: &'i mut alsa::seq::Input<'s>, output: &'o m
   }
 }
 
-fn run_udp(sequencer: &alsa::Seq, hosts: Vec<String>)
-  -> Result<!, alsa::Error>
+
+/// distribute notes from `input` to `outputs`
+fn midiplex<'i, 's, O>(input: &'i mut alsa::seq::Input<'s>, outputs: O)
+    -> Result<!, alsa::Error>
+  where O: IntoIterator,
+        O::Item: Output
 {
-  let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-
-  let mut output =
-    Midiplexer::from_iter(
-      hosts.iter()
-        .map(|host|
-          UdpOutput {
-            addr: host.to_socket_addrs().unwrap().next().unwrap(),
-            socket: &socket
-          }));
-
-  forward_all(&mut sequencer.input(), &mut output)
+  let mut output = outputs::Midiplexer::from_iter(outputs);
+  forward_all(input, &mut output)
 }
+
 
 fn run(options : Options) -> Result<!, alsa::Error> {
   // initialize the ALSA sequencer client
   let sequencer_name = CString::new(env!("CARGO_PKG_NAME")).unwrap();
   let sequencer = alsa::Seq::open(None, None, true)?;
   sequencer.set_client_name(&sequencer_name)?;
+
+  // initialize midi input port
+  sequencer.create_simple_port(
+    &CString::new("input").unwrap(),
+    seq::WRITE | seq::SUBS_WRITE,
+    seq::MIDI_GENERIC | seq::APPLICATION)?;
+
   if let Some(size) = options.input_pool_size {
     sequencer.set_client_pool_input(size)?
   }
-  input(&sequencer)?;
 
-  run_udp(&sequencer, options.hosts)
+  // capture the input stream of events
+  let mut input = sequencer.input();
+
+  match options.output {
+    Mode::UDP{hosts} =>
+      {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        midiplex(&mut input,
+          hosts.iter().map(|host|
+            outputs::UdpOutput {
+              addr: host.to_socket_addrs().unwrap().next().unwrap(),
+              socket: &socket
+            }))
+      },
+    Mode::ALSA{names, output_pool_size} =>
+      {
+        if let Some(size) = output_pool_size {
+          sequencer.set_client_pool_output(size)?;
+        }
+        midiplex(&mut input,
+          names.into_iter().map(|name|
+            outputs::AlsaOutput::new(&sequencer, name).unwrap()))
+
+      },
+  }
 }
 
 

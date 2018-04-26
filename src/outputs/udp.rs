@@ -1,6 +1,7 @@
-use types::*;
 use std::io;
 use std::net::{UdpSocket, SocketAddr};
+use types::*;
+use outputs::Output;
 
 /// An output backed by a UDP socket.
 pub struct UdpOutput<'s> {
