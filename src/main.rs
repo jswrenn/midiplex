@@ -147,12 +147,11 @@ fn run(options : Options) -> Result<!, alsa::Error> {
   match options.output {
     Mode::UDP{hosts} =>
       {
-        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
         midiplex(&mut input,
           hosts.iter().map(|host|
             outputs::UdpOutput {
               addr: host.to_socket_addrs().unwrap().next().unwrap(),
-              socket: &socket
+              socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
             }))
       },
     Mode::ALSA{names, output_pool_size} =>

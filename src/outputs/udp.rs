@@ -4,12 +4,12 @@ use types::*;
 use outputs::Output;
 
 /// An output backed by a UDP socket.
-pub struct UdpOutput<'s> {
+pub struct UdpOutput {
   pub addr  : SocketAddr,
-  pub socket: &'s UdpSocket
+  pub socket: UdpSocket
 }
 
-impl<'s> Output for UdpOutput<'s>
+impl Output for UdpOutput
 {
   type Error = io::Error;
 
@@ -28,7 +28,7 @@ impl<'s> Output for UdpOutput<'s>
   }
 }
 
-impl<'s> Drop for UdpOutput<'s> {
+impl Drop for UdpOutput {
   fn drop(&mut self) {
     let _ = self.silence();
   }
