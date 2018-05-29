@@ -16,10 +16,19 @@ pub struct Midiplexer<O: Output> {
   unallocated     : VecDeque<O>,
   num_outputs     : usize,
   total_velocity  : usize,
+  max_allocation  : Option<usize>,
 }
 
 impl<O: Output> FromIterator<O> for Midiplexer<O> {
   fn from_iter<I: IntoIterator<Item=O>>(iter: I) -> Self {
+    Midiplexer::new(iter, None)
+  }
+}
+
+impl<O: Output> Midiplexer<O> {
+  pub fn new<I>(iter: I, max_allocation: Option<usize>) -> Self
+    where I: IntoIterator<Item=O>
+  {
     let notes       = IndexMap::with_capacity(88);
     let unallocated = iter.into_iter().collect::<VecDeque<_>>();
     let num_outputs = unallocated.len();
@@ -30,17 +39,16 @@ impl<O: Output> FromIterator<O> for Midiplexer<O> {
       unallocated,
       num_outputs,
       total_velocity: 0,
+      max_allocation,
     }
   }
-}
 
-impl<O: Output> Midiplexer<O> {
   /// Adjust the note allocation.
   fn adjust(&mut self)
      -> Result<(), O::Error>
   {
     let mut remaining   = self.num_outputs;
-    let num_outputs     = self.num_outputs as f32;
+    let max_allocation  = self.max_allocation.unwrap_or(self.num_outputs) as f32;
     let total_velocity  = self.total_velocity as f32;
 
     for (&(note, channel), status) in self.notes.iter_mut().rev() {
@@ -48,11 +56,11 @@ impl<O: Output> Midiplexer<O> {
 
       // first, we'll compute an ideal allocation of resources
 
-      let relative_velocity = (status.velocity as f32) / total_velocity;
+      let relative_velocity = f32::from(status.velocity) / total_velocity;
 
       status.target_allocation =
-        min(max(1, (relative_velocity * num_outputs).floor() as usize),
-            remaining);
+        min(max(1, (relative_velocity * max_allocation).floor() as usize),
+            remaining.min(self.max_allocation.unwrap_or(remaining)));
 
       remaining -= status.target_allocation;
 

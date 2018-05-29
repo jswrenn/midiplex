@@ -17,6 +17,7 @@ USAGE:
 
 OPTIONS:
     -i, --input-pool-size <I>   sets the ALSA input pool size
+    -m, --max-allocation <N>    sets the maximum number of outputs allocated to any note
 
 OUTPUT MODES:
     alsa                        ALSA output mode

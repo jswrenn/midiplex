@@ -1,3 +1,4 @@
+#![feature(never_type)]
 #![feature(attr_literals)]
 #![feature(alloc_system)]
 extern crate alloc_system;
@@ -12,7 +13,6 @@ use alsa::seq;
 use std::ffi::CString;
 use clap::AppSettings;
 use structopt::StructOpt;
-use std::iter::FromIterator;
 use std::net::{UdpSocket, ToSocketAddrs};
 
 mod types;
@@ -51,6 +51,10 @@ struct Options {
   /// set the ALSA input pool size
   #[structopt(short = "i", long = "input-pool-size", name="I")]
   input_pool_size: Option<u32>,
+
+  /// set the maximum number of outputs allocated to any note
+  #[structopt(short = "m", long = "max-allocation", name="N")]
+  max_allocation: Option<usize>,
 
   /// set the output mode
   #[structopt(subcommand,name="MODE")]
@@ -115,12 +119,12 @@ fn forward_all<'s, 'i, 'o, O>(input: &'i mut alsa::seq::Input<'s>, output: &'o m
 
 
 /// distribute notes from `input` to `outputs`
-fn midiplex<'i, 's, O>(input: &'i mut alsa::seq::Input<'s>, outputs: O)
+fn midiplex<'i, 's, O>(input: &'i mut alsa::seq::Input<'s>, outputs: O, max_allocation: Option<usize>)
     -> Result<!, alsa::Error>
   where O: IntoIterator,
         O::Item: Output
 {
-  let mut output = outputs::Midiplexer::from_iter(outputs);
+  let mut output = outputs::Midiplexer::new(outputs, max_allocation);
   forward_all(input, &mut output)
 }
 
@@ -152,7 +156,7 @@ fn run(options : Options) -> Result<!, alsa::Error> {
             outputs::UdpOutput {
               addr: host.to_socket_addrs().unwrap().next().unwrap(),
               socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
-            }))
+            }), options.max_allocation)
       },
     Mode::ALSA{names, output_pool_size} =>
       {
@@ -161,7 +165,8 @@ fn run(options : Options) -> Result<!, alsa::Error> {
         }
         midiplex(&mut input,
           names.into_iter().map(|name|
-            outputs::AlsaOutput::new(&sequencer, name).unwrap()))
+            outputs::AlsaOutput::new(&sequencer, name).unwrap()),
+          options.max_allocation)
 
       },
   }
