@@ -47,20 +47,24 @@ impl<O: Output> Midiplexer<O> {
   fn adjust(&mut self)
      -> Result<(), O::Error>
   {
-    let mut remaining   = self.num_outputs;
-    let max_allocation  = self.max_allocation.unwrap_or(self.num_outputs) as f32;
-    let total_velocity  = self.total_velocity as f32;
+    let num_outputs     = self.num_outputs;
+    let max_allocation  = self.max_allocation;
+    let total_velocity  = self.total_velocity;
+
+    let scale =
+      max_allocation
+        .filter(|max_allocation| max_allocation * total_velocity < num_outputs * 128)
+        .map(|max_allocation| max_allocation as f32 / 127.)
+        .unwrap_or(num_outputs as f32 / total_velocity as f32);
+
+    let mut remaining = num_outputs;
 
     for (&(note, channel), status) in self.notes.iter_mut().rev() {
-      use std::cmp::{min,max};
 
       // first, we'll compute an ideal allocation of resources
-
-      let relative_velocity = f32::from(status.velocity) / total_velocity;
-
       status.target_allocation =
-        min(max(1, (relative_velocity * max_allocation).floor() as usize),
-            remaining.min(self.max_allocation.unwrap_or(remaining)));
+        ((status.velocity as f32 * scale) as usize)
+          .min(remaining).max(1);
 
       remaining -= status.target_allocation;
 
