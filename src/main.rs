@@ -7,7 +7,7 @@ extern crate alloc_system;
 extern crate clap;
 extern crate nix;
 extern crate alsa;
-extern crate indexmap;
+#[cfg_attr(test, macro_use)] extern crate indexmap;
 
 use alsa::seq;
 use std::ffi::CString;

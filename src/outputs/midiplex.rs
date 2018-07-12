@@ -4,6 +4,7 @@ use indexmap::IndexMap;
 use types::*;
 use outputs::Output;
 
+#[derive(Debug, PartialEq, Eq)]
 struct State<Output> {
   velocity: u8,
   target_allocation: usize,
@@ -59,41 +60,50 @@ impl<O: Output> Midiplexer<O> {
 
     let mut remaining = num_outputs;
 
-    for (&(note, channel), status) in self.notes.iter_mut().rev() {
-
+    for (&(note, channel), status) in self.notes.iter_mut().rev()
+    {
       // first, we'll compute an ideal allocation of resources
       status.target_allocation =
         ((status.velocity as f32 * scale) as usize)
-          .min(remaining).max(1);
+          .max(1).min(remaining);
 
       remaining -= status.target_allocation;
 
+      if status.outputs.len() < status.target_allocation {
+        continue;
+      }
+
       // then, while the note is over-allocated...
-      while status.outputs.len() > status.target_allocation {
-        // remove each un-needed output from the allocation of this note
-        if let Some(mut output) = status.outputs.pop_front() {
-          // turn off this note for this output
-          output.off(note, channel)?;
-          // add the output to the set of unallocated outputs
-          self.unallocated.push_back(output);
-        } else {
-          return Ok(());
-        }
+      let delta = status.outputs.len() - status.target_allocation;
+      // ... remove each un-needed output from the allocation of this note
+      for mut output in status.outputs.drain(..delta)
+      {
+        // turn off this note for this output
+        output.off(note, channel)?;
+        // add the output to the set of unallocated outputs
+        self.unallocated.push_back(output);
       }
     }
 
     // finally, we'll reallocate the freed-up notes
-    for (&(note, channel), status) in self.notes.iter_mut().rev() {
+    for (&(note, channel), status) in self.notes.iter_mut().rev()
+    {
+      if status.outputs.len() > status.target_allocation
+      {
+        continue;
+      }
+
       // while the note is under-allocated...
-      while status.outputs.len() < status.target_allocation {
-        // take an output from the set of unallocated outputs
-        if let Some(mut output) = self.unallocated.pop_front() {
-          output.on(note, channel, status.velocity)?;
-          // add this output to the set of outputs allocated to this note
-          status.outputs.push_back(output);
-        } else {
-          return Ok(());
-        }
+      let delta =
+        self.unallocated.len()
+          .min(status.target_allocation - status.outputs.len());
+
+      for mut output in self.unallocated.drain(..delta)
+      {
+        // turn the note on for this output
+        output.on(note, channel, status.velocity)?;
+        // add the output to the set of outputs associated with this note
+        status.outputs.push_back(output);
       }
     }
 
@@ -138,7 +148,7 @@ impl<O: Output> Output for Midiplexer<O>
   {
     if let Some(mut status) = self.notes.remove(&(note, channel)) {
       self.total_velocity -= status.velocity as usize;
-      while let Some(mut output) = status.outputs.pop_front() {
+      for mut output in status.outputs.drain(..) {
         output.off(note, channel)?;
         self.unallocated.push_back(output);
       }
@@ -161,4 +171,261 @@ impl<O: Output> Output for Midiplexer<O>
     }
     Ok(())
   }
+}
+
+#[test]
+fn unbounded_allocation()
+{
+  let mut midiplexer =
+    Midiplexer::new(["a", "b", "c", "d"].iter().cloned(), None);
+
+  // 1 note on
+  midiplexer.on(0, 0, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 4,
+          outputs: vec!["a", "b", "c", "d"].into()
+        }
+    });
+
+  // 2 notes on
+  midiplexer.on(0, 1, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 2,
+          outputs: vec!["c", "d"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 2,
+          outputs: vec!["a", "b",].into()
+        }
+    });
+
+  // 3 notes on
+  midiplexer.on(0, 2, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["a"].into()
+        }
+    });
+
+  // 4 notes on
+  midiplexer.on(0, 3, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["a"].into()
+        },
+      (0,3) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["c"].into()
+        },
+    });
+
+  // 5 notes on
+  midiplexer.on(0, 4, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 0,
+          outputs: vec![].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["a"].into()
+        },
+      (0,3) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["c"].into()
+        },
+      (0,4) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+    });
+}
+
+
+#[test]
+fn bounded_allocator()
+{
+  let mut midiplexer =
+    Midiplexer::new(["a", "b", "c", "d"].iter().cloned(), Some(2));
+
+  // 1 note on
+  midiplexer.on(0, 0, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 2,
+          outputs: vec!["a", "b"].into()
+        }
+    });
+
+  // 2 notes on
+  midiplexer.on(0, 1, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 2,
+          outputs: vec!["a", "b"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 2,
+          outputs: vec!["c", "d",].into()
+        }
+    });
+
+  // 3 notes on
+  midiplexer.on(0, 2, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["c"].into()
+        }
+    });
+
+  // 4 notes on
+  midiplexer.on(0, 3, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["c"].into()
+        },
+      (0,3) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["a"].into()
+        },
+    });
+
+  // 5 notes on
+  // To accomodate the output shortage, the allocation from the oldest
+  // note on the books, `(0,0)`, is moved to the newest note, `(0,4)`. 
+  midiplexer.on(0, 4, 127).unwrap();
+  assert_eq!(midiplexer.notes,
+    indexmap!{
+      (0,0) =>
+        State {
+          velocity: 127,
+          target_allocation: 0,
+          outputs: vec![].into()
+        },
+      (0,1) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["d"].into()
+        },
+      (0,2) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["c"].into()
+        },
+      (0,3) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["a"].into()
+        },
+      (0,4) =>
+        State {
+          velocity: 127,
+          target_allocation: 1,
+          outputs: vec!["b"].into()
+        },
+    });
 }

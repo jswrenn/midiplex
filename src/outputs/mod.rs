@@ -4,6 +4,8 @@ pub mod udp;
 pub mod alsa;
 pub mod midiplex;
 
+#[cfg(test)] pub mod dummy;
+
 pub use self::udp::UdpOutput;
 pub use self::alsa::AlsaOutput;
 pub use self::midiplex::Midiplexer;
